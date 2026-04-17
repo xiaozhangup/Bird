@@ -2,6 +2,8 @@
     {
         "port": 2121,
         "dir": "./ftp_data_1",
+        "public_ip": "203.0.113.10",
+        "passive_ports": "30000-30100",
         "users": {
             "admin": "admin123",
             "test1": "111111"
@@ -10,6 +12,8 @@
     {
         "port": 2122,
         "dir": "./ftp_data_2",
+        "public_ip": "203.0.113.10",
+        "passive_ports": "30101-30200",
         "users": {
             "boss": "888888"
         }

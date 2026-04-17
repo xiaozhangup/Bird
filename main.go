@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime/debug"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,17 +29,22 @@ const (
 )
 
 const birdBanner = `
-     _.-.      ██████  ██ ██████  ██████  
-   /' v '\     ██   ██ ██ ██   ██ ██   ██ 
-  (/     \)    ██████  ██ ██████  ██   ██ 
- ="="="="="=   ██   ██ ██ ██   ██ ██   ██ 
-   //   \\     ██████  ██ ██   ██ ██████  
+     _.-.      ██████  ██ ██████  ██████ 
+   /' v '\     ██   ██ ██ ██   ██ ██   ██
+  (/     \)    ██████  ██ ██████  ██   ██
+ ="="="="="=   ██   ██ ██ ██   ██ ██   ██
+   //   \\     ██████  ██ ██   ██ ██████ 
+  ^^     ^^      Git Ver: %s
 `
 
+var buildRevision = "dev"
+
 type ServerConfig struct {
-	Port  int               `json:"port"`
-	Dir   string            `json:"dir"`
-	Users map[string]string `json:"users"`
+	Port         int               `json:"port"`
+	Dir          string            `json:"dir"`
+	Users        map[string]string `json:"users"`
+	PublicIP     string            `json:"public_ip"`
+	PassivePorts string            `json:"passive_ports"`
 }
 
 type MultiUserAuth struct {
@@ -120,15 +126,41 @@ func (l *FTPLogger) PrintResponse(sessionId string, code int, message string) {
 }
 
 func printBanner(configFile string, count int) {
-	bannerLines := strings.Split(strings.Trim(birdBanner, "\r\n"), "\n")
+	revision := getBuildRevision()
+	banner := fmt.Sprintf(birdBanner, revision)
+
+	bannerLines := strings.Split(strings.Trim(banner, "\r\n"), "\n")
 	for _, line := range bannerLines {
 		log.Println(colorize(colorLime, line))
 	}
 	log.Println()
 	logInfo("Bird FTP Server is starting...")
+	logInfo("Build Rev   : %s", colorize(colorMagenta, revision))
 	logInfo("Config File : %s", colorize(colorCyan, configFile))
 	logInfo("Instances   : %d", count)
 	log.Println(colorize(colorGray, strings.Repeat("-", 50)))
+}
+
+func getBuildRevision() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				if len(setting.Value) >= 12 {
+					return setting.Value[:12]
+				}
+				return setting.Value
+			}
+		}
+	}
+
+	if buildRevision != "" && buildRevision != "dev" {
+		if len(buildRevision) >= 12 {
+			return buildRevision[:12]
+		}
+		return buildRevision
+	}
+
+	return "unknown"
 }
 
 func main() {
@@ -173,11 +205,13 @@ func main() {
 			}
 
 			opts := &server.ServerOpts{
-				Name:    "Bird FTP Server",
-				Factory: factory,
-				Auth:    &MultiUserAuth{Users: c.Users},
-				Logger:  &FTPLogger{},
-				Port:    c.Port,
+				Name:         "Bird FTP Server",
+				Factory:      factory,
+				Auth:         &MultiUserAuth{Users: c.Users},
+				Logger:       &FTPLogger{},
+				Port:         c.Port,
+				PublicIp:     c.PublicIP,
+				PassivePorts: c.PassivePorts,
 			}
 
 			ftpServer := server.NewServer(opts)
@@ -190,6 +224,12 @@ func main() {
 
 			logSuccess("Instance running on port %s", colorize(colorYellow, fmt.Sprintf("%d", c.Port)))
 			logInfo("  ├─ Directory: %s", c.Dir)
+			if c.PublicIP != "" {
+				logInfo("  ├─ PublicIP : %s", c.PublicIP)
+			}
+			if c.PassivePorts != "" {
+				logInfo("  ├─ PASV Port: %s", c.PassivePorts)
+			}
 			logInfo("  └─ Users    : %s", strings.Join(userList, ", "))
 			log.Println()
 
