@@ -3,15 +3,20 @@ package main
 import (
 	"runtime/debug"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	filedriver "github.com/goftp/file-driver"
 	"github.com/goftp/server"
@@ -45,6 +50,171 @@ type ServerConfig struct {
 	Users        map[string]string `json:"users"`
 	PublicIP     string            `json:"public_ip"`
 	PassivePorts string            `json:"passive_ports"`
+	BackupFiles  []string          `json:"backup_files"`
+}
+
+type BackupFileDriverFactory struct {
+	RootPath      string
+	WatchedFiles  []string
+	Perm          server.Perm
+	InstanceLabel string
+}
+
+func (factory *BackupFileDriverFactory) NewDriver() (server.Driver, error) {
+	base := &filedriver.FileDriver{RootPath: factory.RootPath, Perm: factory.Perm}
+
+	watchedRealPaths := normalizeWatchedRealPaths(factory.RootPath, factory.WatchedFiles)
+	return &BackupFileDriver{
+		base:             base,
+		watchedRealPaths: watchedRealPaths,
+		enabled:          len(watchedRealPaths) > 0,
+		instanceLabel:    factory.InstanceLabel,
+	}, nil
+}
+
+type BackupFileDriver struct {
+	base             *filedriver.FileDriver
+	watchedRealPaths map[string]struct{}
+	enabled          bool
+	instanceLabel    string
+}
+
+func normalizeWatchedRealPaths(rootPath string, watchedFiles []string) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, watchedFile := range watchedFiles {
+		trimmed := strings.TrimSpace(watchedFile)
+		if trimmed == "" {
+			continue
+		}
+
+		ftpPath := trimmed
+		if !strings.HasPrefix(ftpPath, "/") {
+			ftpPath = "/" + ftpPath
+		}
+
+		realPath := realPathFromFTPPath(rootPath, ftpPath)
+		absPath, err := filepath.Abs(realPath)
+		if err != nil {
+			result[filepath.Clean(realPath)] = struct{}{}
+			continue
+		}
+		result[filepath.Clean(absPath)] = struct{}{}
+	}
+
+	return result
+}
+
+func realPathFromFTPPath(rootPath, path string) string {
+	segments := strings.Split(path, "/")
+	return filepath.Join(append([]string{rootPath}, segments...)...)
+}
+
+func backupPathBeforeWrite(originalPath string) (string, error) {
+	dir := filepath.Dir(originalPath)
+	backupDir := filepath.Join(dir, "backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return "", err
+	}
+
+	baseName := filepath.Base(originalPath)
+	ext := filepath.Ext(baseName)
+	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+	timestamp := time.Now().Format("2006-01-02 15-04-05")
+
+	candidate := filepath.Join(backupDir, fmt.Sprintf("%s (%s)%s", nameWithoutExt, timestamp, ext))
+	if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+		return candidate, nil
+	}
+
+	for i := 1; i <= 9999; i++ {
+		candidate = filepath.Join(backupDir, fmt.Sprintf("%s (%s %s)%s", nameWithoutExt, timestamp, strconv.Itoa(i), ext))
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("unable to allocate backup file name for %s", originalPath)
+}
+
+func copyFile(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *BackupFileDriver) Init(conn *server.Conn) {
+	d.base.Init(conn)
+}
+
+func (d *BackupFileDriver) Stat(path string) (server.FileInfo, error) {
+	return d.base.Stat(path)
+}
+
+func (d *BackupFileDriver) ChangeDir(path string) error {
+	return d.base.ChangeDir(path)
+}
+
+func (d *BackupFileDriver) ListDir(path string, callback func(server.FileInfo) error) error {
+	return d.base.ListDir(path, callback)
+}
+
+func (d *BackupFileDriver) DeleteDir(path string) error {
+	return d.base.DeleteDir(path)
+}
+
+func (d *BackupFileDriver) DeleteFile(path string) error {
+	return d.base.DeleteFile(path)
+}
+
+func (d *BackupFileDriver) Rename(fromPath string, toPath string) error {
+	return d.base.Rename(fromPath, toPath)
+}
+
+func (d *BackupFileDriver) MakeDir(path string) error {
+	return d.base.MakeDir(path)
+}
+
+func (d *BackupFileDriver) GetFile(path string, offset int64) (int64, io.ReadCloser, error) {
+	return d.base.GetFile(path, offset)
+}
+
+func (d *BackupFileDriver) PutFile(destPath string, data io.Reader, appendData bool) (int64, error) {
+	if d.enabled {
+		destRealPath := realPathFromFTPPath(d.base.RootPath, destPath)
+		destAbsPath, err := filepath.Abs(destRealPath)
+		if err != nil {
+			destAbsPath = filepath.Clean(destRealPath)
+		}
+
+		if _, watched := d.watchedRealPaths[filepath.Clean(destAbsPath)]; watched {
+			if st, statErr := os.Stat(destAbsPath); statErr == nil && !st.IsDir() {
+				backupPath, backupErr := backupPathBeforeWrite(destAbsPath)
+				if backupErr != nil {
+					return 0, backupErr
+				}
+				if copyErr := copyFile(destAbsPath, backupPath); copyErr != nil {
+					return 0, copyErr
+				}
+				logInfo("[%s] backup created: %s", d.instanceLabel, backupPath)
+			}
+		}
+	}
+
+	return d.base.PutFile(destPath, data, appendData)
 }
 
 type MultiUserAuth struct {
@@ -194,14 +364,18 @@ func main() {
 		go func(c ServerConfig) {
 			defer wg.Done()
 
+			backupFiles := c.BackupFiles
+
 			if err := os.MkdirAll(c.Dir, 0755); err != nil {
 				logError("[Port %d] Failed to create directory %s: %v", c.Port, c.Dir, err)
 				return
 			}
 
-			factory := &filedriver.FileDriverFactory{
-				RootPath: c.Dir,
-				Perm:     server.NewSimplePerm("ftpuser", "ftpgroup"),
+			factory := &BackupFileDriverFactory{
+				RootPath:      c.Dir,
+				WatchedFiles:  backupFiles,
+				Perm:          server.NewSimplePerm("ftpuser", "ftpgroup"),
+				InstanceLabel: fmt.Sprintf("Port %d", c.Port),
 			}
 
 			opts := &server.ServerOpts{
@@ -229,6 +403,23 @@ func main() {
 			}
 			if c.PassivePorts != "" {
 				logInfo("  ├─ PASV Port: %s", c.PassivePorts)
+			}
+			if len(backupFiles) > 0 {
+				logInfo("  ├─ Backup")
+				var validBackupFiles []string
+				for _, watched := range backupFiles {
+					if strings.TrimSpace(watched) == "" {
+						continue
+					}
+					validBackupFiles = append(validBackupFiles, watched)
+				}
+				for i, watched := range validBackupFiles {
+					branch := "├─"
+					if i == len(validBackupFiles)-1 {
+						branch = "└─"
+					}
+					logInfo("  │  %s %s", branch, watched)
+				}
 			}
 			logInfo("  └─ Users    : %s", strings.Join(userList, ", "))
 			log.Println()

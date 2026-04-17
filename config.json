@@ -2,6 +2,10 @@
     {
         "port": 2121,
         "dir": "./ftp_data_1",
+        "backup_files": [
+            "watched.txt",
+            "docs/report.csv"
+        ],
         "public_ip": "203.0.113.10",
         "passive_ports": "30000-30100",
         "users": {
