@@ -51,11 +51,13 @@ type ServerConfig struct {
 	PublicIP     string            `json:"public_ip"`
 	PassivePorts string            `json:"passive_ports"`
 	BackupFiles  []string          `json:"backup_files"`
+	IgnoredFiles []string          `json:"ignored_files"`
 }
 
 type BackupFileDriverFactory struct {
 	RootPath      string
 	WatchedFiles  []string
+	IgnoredFiles  []string
 	Perm          server.Perm
 	InstanceLabel string
 }
@@ -64,17 +66,20 @@ func (factory *BackupFileDriverFactory) NewDriver() (server.Driver, error) {
 	base := &filedriver.FileDriver{RootPath: factory.RootPath, Perm: factory.Perm}
 
 	watchedRealPaths := normalizeWatchedRealPaths(factory.RootPath, factory.WatchedFiles)
+	ignoredRealPaths := normalizeIgnoredRealPaths(factory.RootPath, factory.IgnoredFiles)
 	return &BackupFileDriver{
-		base:             base,
+		base:            base,
 		watchedRealPaths: watchedRealPaths,
-		enabled:          len(watchedRealPaths) > 0,
-		instanceLabel:    factory.InstanceLabel,
+		enabled:         len(watchedRealPaths) > 0,
+		ignoredRealPaths: ignoredRealPaths,
+		instanceLabel:   factory.InstanceLabel,
 	}, nil
 }
 
 type BackupFileDriver struct {
 	base             *filedriver.FileDriver
 	watchedRealPaths map[string]struct{}
+	ignoredRealPaths map[string]struct{}
 	enabled          bool
 	instanceLabel    string
 }
@@ -83,6 +88,31 @@ func normalizeWatchedRealPaths(rootPath string, watchedFiles []string) map[strin
 	result := make(map[string]struct{})
 	for _, watchedFile := range watchedFiles {
 		trimmed := strings.TrimSpace(watchedFile)
+		if trimmed == "" {
+			continue
+		}
+
+		ftpPath := trimmed
+		if !strings.HasPrefix(ftpPath, "/") {
+			ftpPath = "/" + ftpPath
+		}
+
+		realPath := realPathFromFTPPath(rootPath, ftpPath)
+		absPath, err := filepath.Abs(realPath)
+		if err != nil {
+			result[filepath.Clean(realPath)] = struct{}{}
+			continue
+		}
+		result[filepath.Clean(absPath)] = struct{}{}
+	}
+
+	return result
+}
+
+func normalizeIgnoredRealPaths(rootPath string, ignoredFiles []string) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, ignoredFile := range ignoredFiles {
+		trimmed := strings.TrimSpace(ignoredFile)
 		if trimmed == "" {
 			continue
 		}
@@ -177,10 +207,39 @@ func (d *BackupFileDriver) DeleteDir(path string) error {
 }
 
 func (d *BackupFileDriver) DeleteFile(path string) error {
+	destRealPath := realPathFromFTPPath(d.base.RootPath, path)
+	destAbsPath, err := filepath.Abs(destRealPath)
+	if err != nil {
+		destAbsPath = filepath.Clean(destRealPath)
+	}
+
+	if _, ignored := d.ignoredRealPaths[filepath.Clean(destAbsPath)]; ignored {
+		return nil
+	}
+
 	return d.base.DeleteFile(path)
 }
 
 func (d *BackupFileDriver) Rename(fromPath string, toPath string) error {
+	fromRealPath := realPathFromFTPPath(d.base.RootPath, fromPath)
+	fromAbsPath, err := filepath.Abs(fromRealPath)
+	if err != nil {
+		fromAbsPath = filepath.Clean(fromRealPath)
+	}
+
+	toRealPath := realPathFromFTPPath(d.base.RootPath, toPath)
+	toAbsPath, err := filepath.Abs(toRealPath)
+	if err != nil {
+		toAbsPath = filepath.Clean(toRealPath)
+	}
+
+	if _, ignored := d.ignoredRealPaths[filepath.Clean(fromAbsPath)]; ignored {
+		return nil
+	}
+	if _, ignored := d.ignoredRealPaths[filepath.Clean(toAbsPath)]; ignored {
+		return nil
+	}
+
 	return d.base.Rename(fromPath, toPath)
 }
 
@@ -193,14 +252,20 @@ func (d *BackupFileDriver) GetFile(path string, offset int64) (int64, io.ReadClo
 }
 
 func (d *BackupFileDriver) PutFile(destPath string, data io.Reader, appendData bool) (int64, error) {
-	if d.enabled {
-		destRealPath := realPathFromFTPPath(d.base.RootPath, destPath)
-		destAbsPath, err := filepath.Abs(destRealPath)
-		if err != nil {
-			destAbsPath = filepath.Clean(destRealPath)
-		}
+	destRealPath := realPathFromFTPPath(d.base.RootPath, destPath)
+	destAbsPath, err := filepath.Abs(destRealPath)
+	if err != nil {
+		destAbsPath = filepath.Clean(destRealPath)
+	}
+	destCleanPath := filepath.Clean(destAbsPath)
 
-		if _, watched := d.watchedRealPaths[filepath.Clean(destAbsPath)]; watched {
+	if _, ignored := d.ignoredRealPaths[destCleanPath]; ignored {
+		io.ReadAll(data)
+		return 0, nil
+	}
+
+	if d.enabled {
+		if _, watched := d.watchedRealPaths[destCleanPath]; watched {
 			if st, statErr := os.Stat(destAbsPath); statErr == nil && !st.IsDir() && st.Size() > 0 {
 				backupPath, backupErr := backupPathBeforeWrite(destAbsPath)
 				if backupErr != nil {
@@ -374,6 +439,7 @@ func main() {
 			factory := &BackupFileDriverFactory{
 				RootPath:      c.Dir,
 				WatchedFiles:  backupFiles,
+				IgnoredFiles:  c.IgnoredFiles,
 				Perm:          server.NewSimplePerm("ftpuser", "ftpgroup"),
 				InstanceLabel: fmt.Sprintf("Port %d", c.Port),
 			}
@@ -419,6 +485,23 @@ func main() {
 						branch = "└─"
 					}
 					logInfo("  │  %s %s", branch, watched)
+				}
+			}
+			if len(c.IgnoredFiles) > 0 {
+				logInfo("  ├─ Ignored")
+				var validIgnoredFiles []string
+				for _, ignored := range c.IgnoredFiles {
+					if strings.TrimSpace(ignored) == "" {
+						continue
+					}
+					validIgnoredFiles = append(validIgnoredFiles, ignored)
+				}
+				for i, ignored := range validIgnoredFiles {
+					branch := "├─"
+					if i == len(validIgnoredFiles)-1 {
+						branch = "└─"
+					}
+					logInfo("  │  %s %s", branch, ignored)
 				}
 			}
 			logInfo("  └─ Users    : %s", strings.Join(userList, ", "))

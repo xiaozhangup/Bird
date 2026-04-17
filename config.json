@@ -6,6 +6,10 @@
             "watched.txt",
             "docs/report.csv"
         ],
+        "ignored_files": [
+            "config.txt",
+            "admin/settings.ini"
+        ],
         "public_ip": "203.0.113.10",
         "passive_ports": "30000-30100",
         "users": {
