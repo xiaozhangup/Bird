@@ -3,56 +3,156 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"sort"
+	"strings"
 	"sync"
+	"syscall"
 
 	filedriver "github.com/goftp/file-driver"
 	"github.com/goftp/server"
 )
 
-// ServerConfig 映射配置文件中的单个 FTP 实例配置
+const (
+	colorReset   = "\033[0m"
+	colorGreen   = "\033[38;5;118m"
+	colorLime    = "\033[38;5;190m"
+	colorYellow  = "\033[38;5;226m"
+	colorRed     = "\033[38;5;196m"
+	colorCyan    = "\033[38;5;51m"
+	colorMagenta = "\033[38;5;201m"
+	colorGray    = "\033[38;5;245m"
+)
+
+const birdBanner = `
+     _.-.      ██████  ██ ██████  ██████  
+   /' v '\     ██   ██ ██ ██   ██ ██   ██ 
+  (/     \)    ██████  ██ ██████  ██   ██ 
+ ="="="="="=   ██   ██ ██ ██   ██ ██   ██ 
+   //   \\     ██████  ██ ██   ██ ██████  
+`
+
 type ServerConfig struct {
 	Port  int               `json:"port"`
 	Dir   string            `json:"dir"`
 	Users map[string]string `json:"users"`
 }
 
-// MultiUserAuth 自定义多用户认证器
 type MultiUserAuth struct {
-	Users map[string]string // 存储 用户名 -> 密码
+	Users map[string]string // 用户名 -> 密码
 }
 
-// CheckPasswd 实现 server.Auth 接口
 func (m *MultiUserAuth) CheckPasswd(username, password string) (bool, error) {
 	if expectedPwd, ok := m.Users[username]; ok {
 		if expectedPwd == password {
-			return true, nil // 密码正确
+			return true, nil
 		}
 	}
-	return false, nil // 密码错误或用户不存在
+	return false, nil
+}
+
+func init() {
+	log.SetFlags(0)
+}
+
+func colorize(color, text string) string {
+	return color + text + colorReset
+}
+
+func logInfo(format string, args ...any) {
+	log.Printf(colorize(colorGreen, "[INFO] ")+" "+format, args...)
+}
+
+func logSuccess(format string, args ...any) {
+	log.Printf(colorize(colorLime, "[OK]   ")+" "+format, args...)
+}
+
+func logWarn(format string, args ...any) {
+	log.Printf(colorize(colorYellow, "[WARN] ")+" "+format, args...)
+}
+
+func logError(format string, args ...any) {
+	log.Printf(colorize(colorRed, "[ERROR]")+" "+format, args...)
+}
+
+type FTPLogger struct{}
+
+func (l *FTPLogger) Print(sessionId string, message interface{}) {
+	if sessionId == "" {
+		logInfo("%v", message)
+	} else {
+		logInfo("[%s] %v", colorize(colorGray, sessionId), message)
+	}
+}
+
+func (l *FTPLogger) Printf(sessionId string, format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	if sessionId == "" {
+		logInfo("%s", msg)
+	} else {
+		logInfo("[%s] %s", colorize(colorGray, sessionId), msg)
+	}
+}
+
+func (l *FTPLogger) PrintCommand(sessionId string, command string, params string) {
+	if strings.ToUpper(command) == "PASS" {
+		params = "******"
+	}
+	
+	cmdStr := colorize(colorLime, command+" "+params)
+	if sessionId == "" {
+		logInfo("> %s", cmdStr)
+	} else {
+		logInfo("[%s] > %s", colorize(colorGray, sessionId), cmdStr)
+	}
+}
+
+func (l *FTPLogger) PrintResponse(sessionId string, code int, message string) {
+	respStr := colorize(colorGreen, fmt.Sprintf("%d %s", code, message))
+	if sessionId == "" {
+		logInfo("< %s", respStr)
+	} else {
+		logInfo("[%s] < %s", colorize(colorGray, sessionId), respStr)
+	}
+}
+
+func printBanner(configFile string, count int) {
+	bannerLines := strings.Split(strings.Trim(birdBanner, "\r\n"), "\n")
+	for _, line := range bannerLines {
+		log.Println(colorize(colorLime, line))
+	}
+	log.Println()
+	logInfo("Bird FTP Server is starting...")
+	logInfo("Config File : %s", colorize(colorCyan, configFile))
+	logInfo("Instances   : %d", count)
+	log.Println(colorize(colorGray, strings.Repeat("-", 50)))
 }
 
 func main() {
-	// 1. 定义命令行参数
 	configFile := flag.String("config", "config.json", "配置文件路径")
 	flag.Parse()
 
-	// 2. 读取配置文件内容
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
-		log.Fatalf("读取配置文件失败 (%s): %v", *configFile, err)
+		logError("Failed to read config file (%s): %v", *configFile, err)
+		os.Exit(1)
 	}
 
-	// 3. 解析 JSON
 	var configs []ServerConfig
 	if err := json.Unmarshal(data, &configs); err != nil {
-		log.Fatalf("解析配置文件失败: %v\n请检查 JSON 格式是否正确。", err)
+		logError("Failed to parse JSON config: %v", err)
+		os.Exit(1)
 	}
 
 	if len(configs) == 0 {
-		log.Fatalf("配置文件中没有找到任何服务器配置")
+		logError("No server configuration found in the config file.")
+		os.Exit(1)
 	}
+
+	printBanner(*configFile, len(configs))
 
 	var wg sync.WaitGroup
 
@@ -62,46 +162,53 @@ func main() {
 		go func(c ServerConfig) {
 			defer wg.Done()
 
-			// 确保目录存在
 			if err := os.MkdirAll(c.Dir, 0755); err != nil {
-				log.Printf("[端口 %d] 无法创建FTP根目录 %s: %v", c.Port, c.Dir, err)
+				logError("[Port %d] Failed to create directory %s: %v", c.Port, c.Dir, err)
 				return
 			}
 
-			// 设置文件系统驱动 (v1 和 v2 相同)
 			factory := &filedriver.FileDriverFactory{
 				RootPath: c.Dir,
 				Perm:     server.NewSimplePerm("ftpuser", "ftpgroup"),
 			}
 
-			// 配置 FTP 服务器选项 (★ 区别1：v1 叫 ServerOpts，驱动参数叫 Factory)
 			opts := &server.ServerOpts{
-				Name:    "My Configured Go FTP Server",
-				Factory: factory, 
+				Name:    "Bird FTP Server",
+				Factory: factory,
 				Auth:    &MultiUserAuth{Users: c.Users},
+				Logger:  &FTPLogger{},
 				Port:    c.Port,
 			}
 
-			// 初始化服务器 (★ 区别2：v1 版本的 NewServer 只返回一个对象，不返回错误)
 			ftpServer := server.NewServer(opts)
 
 			var userList []string
 			for u := range c.Users {
 				userList = append(userList, u)
 			}
+			sort.Strings(userList)
 
-			log.Printf("=> [启动成功] FTP 实例监听端口: %d | 目录: %s | 用户: %v", c.Port, c.Dir, userList)
+			logSuccess("Instance running on port %s", colorize(colorYellow, fmt.Sprintf("%d", c.Port)))
+			logInfo("  ├─ Directory: %s", c.Dir)
+			logInfo("  └─ Users    : %s", strings.Join(userList, ", "))
+			log.Println()
 
-			// 启动监听
 			if err := ftpServer.ListenAndServe(); err != nil {
-				log.Printf("[端口 %d] FTP服务器运行出错退出: %v", c.Port, err)
+				logError("[Port %d] Server stopped: %v", c.Port, err)
 			}
 		}(cfg)
 	}
 
-	log.Println("=================================================")
-	log.Println("所有配置的 FTP 实例已触发启动，按 Ctrl+C 结束程序")
-	log.Println("=================================================")
+	// 退出程序
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println()
+		logWarn("Interrupt signal received. Shutting down Bird FTP Server...")
+		os.Exit(0)
+	}()
 
 	wg.Wait()
 }
