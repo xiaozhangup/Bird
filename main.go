@@ -201,7 +201,7 @@ func (d *BackupFileDriver) PutFile(destPath string, data io.Reader, appendData b
 		}
 
 		if _, watched := d.watchedRealPaths[filepath.Clean(destAbsPath)]; watched {
-			if st, statErr := os.Stat(destAbsPath); statErr == nil && !st.IsDir() {
+			if st, statErr := os.Stat(destAbsPath); statErr == nil && !st.IsDir() && st.Size() > 0 {
 				backupPath, backupErr := backupPathBeforeWrite(destAbsPath)
 				if backupErr != nil {
 					return 0, backupErr
