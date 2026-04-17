@@ -1,0 +1,17 @@
+[
+    {
+        "port": 2121,
+        "dir": "./ftp_data_1",
+        "users": {
+            "admin": "admin123",
+            "test1": "111111"
+        }
+    },
+    {
+        "port": 2122,
+        "dir": "./ftp_data_2",
+        "users": {
+            "boss": "888888"
+        }
+    }
+]
